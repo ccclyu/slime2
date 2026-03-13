@@ -24,7 +24,7 @@ fi
 echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-source "${SCRIPT_DIR}/models/qwen3-4B.sh"
+source "${SCRIPT_DIR}/../../scripts/models/qwen3-4B.sh"
 
 CKPT_ARGS=(
    --hf-checkpoint /root/Qwen3-4B-Base
@@ -44,7 +44,7 @@ ROLLOUT_ARGS=(
    --num-rollout 30000
    --rollout-batch-size 512
    --n-samples-per-prompt 8
-   --rollout-max-response-len 8192
+   --rollout-max-response-len 20480
    --rollout-temperature 1
 
    --num-steps-per-rollout 16
@@ -56,7 +56,7 @@ EVAL_ARGS=(
    --eval-interval 20
    --eval-prompt-data aime /root/aime-2024/aime-2024.jsonl
    --n-samples-per-eval-prompt 32
-   --eval-max-response-len 8192
+   --eval-max-response-len 20480
    --eval-top-p 0.7
    --eval-reward-key score
 )
@@ -102,7 +102,7 @@ WANDB_ARGS=(
    --use-wandb
    --wandb-team n-alignment
    --wandb-project slime-async-profile
-   --wandb-group qwen3-4b-dapo-8k-partial-rollout-no-staleness
+   --wandb-group qwen3-4b-dapo-20k-minibatch
    --wandb-key 852fc153cc57c9266416085a2d78f2ca9277e671
 )
 

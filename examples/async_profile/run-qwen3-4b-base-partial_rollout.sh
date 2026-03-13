@@ -41,13 +41,16 @@ ROLLOUT_ARGS=(
    --rollout-shuffle
    --rm-type dapo
    --reward-key score
-   --num-rollout 3000
-   --rollout-batch-size 32
+   --num-rollout 30000
+   --rollout-batch-size 512
    --n-samples-per-prompt 8
-   --rollout-max-response-len 8192
+   --rollout-max-response-len 20480
    --rollout-temperature 1
+   --partial-rollout
+   --mask-offpolicy-in-partial-rollout
 
-   --global-batch-size 256
+   --num-steps-per-rollout 16
+   #--global-batch-size 256
    --balance-data
 )
 
@@ -55,7 +58,7 @@ EVAL_ARGS=(
    --eval-interval 20
    --eval-prompt-data aime /root/aime-2024/aime-2024.jsonl
    --n-samples-per-eval-prompt 32
-   --eval-max-response-len 8192
+   --eval-max-response-len 20480
    --eval-top-p 0.7
    --eval-reward-key score
 )
@@ -101,7 +104,7 @@ WANDB_ARGS=(
    --use-wandb
    --wandb-team n-alignment
    --wandb-project slime-async-profile
-   --wandb-group qwen3-4b-dapo-8k-onpolicy
+   --wandb-group qwen3-4b-dapo-8k-partial-rollout-no-staleness
    --wandb-key 852fc153cc57c9266416085a2d78f2ca9277e671
 )
 
