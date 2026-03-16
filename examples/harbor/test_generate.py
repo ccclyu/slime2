@@ -1,51 +1,49 @@
-"""Standalone test for generate_with_harbor.generate on SWEBench tasks.
+"""Standalone test for harbor_rollout.generate on harbor tasks.
 
 Usage:
     # Single task — full verbose output:
-    python test_generate.py -t django__django-13410 --hf-checkpoint Qwen/Qwen3-Coder-Next \\
-        --sglang-url http://127.0.0.1:30000
+    python test_generate.py -t django__django-13410 --parquet swebench-verified_2026_02_16.parquet \\
+        --hf-checkpoint Qwen/Qwen3-Coder-Next --sglang-url http://127.0.0.1:30000
 
     # Multiple tasks concurrently — summary table:
-    python test_generate.py --tasks django__django-13410 sympy__sympy-19346 pytest-dev__pytest-7236 \\
+    python test_generate.py --tasks django__django-13410 sympy__sympy-19346 \\
+        --parquet swebench-verified_2026_02_16.parquet \\
         --hf-checkpoint Qwen/Qwen3-Coder-Next --sglang-url http://127.0.0.1:30000
 
     # Default 10 concurrent tasks:
-    python test_generate.py --n-tasks 10 --hf-checkpoint Qwen/Qwen3-Coder-Next \\
-        --sglang-url http://127.0.0.1:30000
+    python test_generate.py --n-tasks 10 --parquet swebench-verified_2026_02_16.parquet \\
+        --hf-checkpoint Qwen/Qwen3-Coder-Next --sglang-url http://127.0.0.1:30000
 
     # Offline proxy unit tests only (tokenizer required, no SGLang or Docker):
     python test_generate.py --unit-test --hf-checkpoint Qwen/Qwen3-Coder-Next
 
-# pip install aioboto3 weave strands-agents anls esprima modal harbor
-# curl -SL https://github.com/docker/compose/releases/download/v2.34.0/docker-compose-linux-x86_64 \\
-#     -o /usr/lib/docker/cli-plugins/docker-compose && chmod +x ...
-
 The script:
-  1. Downloads the task via harbor's TaskClient (cached after first run).
-  2. Loads the task instruction from instruction.md.
-  3. Builds a minimal args Namespace and a Sample.
-  4. Calls generate() and prints reward, turn count, and token stats.
-  5. Verifies strict token-in/token-out invariants on the captured turns.
+  1. Loads task instruction and task_dir from the parquet file.
+  2. Builds a minimal args Namespace and a Sample.
+  3. Calls generate() and prints reward, turn count, and token stats.
+  4. Verifies strict token-in/token-out invariants on the captured turns.
 """
 
 import argparse
 import asyncio
 import json
 import logging
+import os
 import sys
 from argparse import Namespace
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
+
+import yaml
 
 sys.path.insert(0, str(Path(__file__).parents[3] / "harbor" / "src"))
 sys.path.insert(0, str(Path(__file__).parents[2]))
 
+import pandas as pd
+
 from slime.utils.types import Sample
 from slime.utils.processing_utils import load_tokenizer
-
-from harbor.models.task.id import GitTaskId
-from harbor.models.task.task import Task
-from harbor.tasks.client import TaskClient
 
 from rich.console import Console
 from rich.panel import Panel
@@ -53,14 +51,9 @@ from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 
-from generate_with_harbor import SWEBENCH_CONFIGS, _AGENT_URL_ENV, generate
-from model_proxy import (
-    CapturedTurn,
-    ModelInterceptProxy,
-    _OPENAI_FINISH_REASON,
-    _content_blocks_to_openai_message,
-    _openai_sse_events,
-)
+from harbor_rollout import generate
+from model_proxy import AgentTurn, ModelInterceptProxy
+from protocol_adapter import ProtocolAdapter
 
 logging.basicConfig(
     level=logging.INFO,
@@ -69,6 +62,7 @@ logging.basicConfig(
 logger = logging.getLogger("test_generate")
 
 _console = Console()
+_protocol_adapter = ProtocolAdapter()
 
 # Default pool of tasks used by --n-tasks
 DEFAULT_TASKS: list[str] = [
@@ -84,41 +78,104 @@ DEFAULT_TASKS: list[str] = [
     "pydata__xarray-6721",
 ]
 
+DEFAULT_CONFIG_PATH = Path(__file__).with_name("swe_harbor.yaml")
+
 
 # ---------------------------------------------------------------------------
 # Minimal args stub
 # ---------------------------------------------------------------------------
 
 
-def _build_args(hf_checkpoint: str) -> Namespace:
+def _load_custom_config(config_path: str | Path) -> dict[str, Any]:
+    with open(config_path) as f:
+        data = yaml.safe_load(f) or {}
+    if not isinstance(data, dict):
+        raise ValueError(f"custom config at {config_path} must be a mapping")
+    return data
+
+
+def _build_args(
+    hf_checkpoint: str,
+    sglang_url: str,
+    custom_config: dict[str, Any] | None = None,
+) -> Namespace:
     """Build a minimal Namespace satisfying SlimeArgs (via @typed_generate)."""
-    return Namespace(
+    parsed = urlparse(sglang_url)
+    args = Namespace(
         hf_checkpoint=hf_checkpoint,
-        model_name=None,
+        model_name=hf_checkpoint,
         sglang_server_concurrency=512,
         rollout_num_gpus=1,
         rollout_num_gpus_per_engine=1,
         rollout_max_response_len=32768,
-        sglang_router_ip="127.0.0.1",
-        sglang_router_port=30000,
+        rollout_max_context_len=None,
+        rollout_max_prompt_len=None,
+        rollout_stop=None,
+        rollout_stop_token_ids=None,
+        rollout_skip_special_tokens=False,
+        rollout_shuffle=False,
+        rollout_seed=42,
+        rollout_temperature=1.0,
+        rollout_top_p=1.0,
+        rollout_top_k=1,
+        rollout_batch_size=1,
+        n_samples_per_prompt=1,
+        over_sampling_batch_size=None,
+        eps_clip=0.2,
+        eps_clip_high=None,
+        kl_coef=0.0,
+        kl_loss_coef=0.0,
+        gamma=1.0,
+        lambd=1.0,
+        normalize_advantages=False,
+        custom_generate_function_path=None,
+        custom_rm_path=None,
+        apply_chat_template=False,
+        apply_chat_template_kwargs={},
+        ci_test=False,
+        sglang_router_ip=parsed.hostname,
+        sglang_router_port=parsed.port,
     )
+    if custom_config:
+        for key, value in custom_config.items():
+            setattr(args, key, value)
+    return args
 
 
 # ---------------------------------------------------------------------------
-# Task instruction loader
+# Task loader (from parquet)
 # ---------------------------------------------------------------------------
 
+_parquet_cache: dict[str, pd.DataFrame] = {}
 
-def _load_instruction(task_id: str) -> str:
-    cfg = SWEBENCH_CONFIGS
-    task_git_id = GitTaskId(
-        git_url=cfg["git_url"],
-        git_commit_id=cfg["git_commit_id"],
-        path=Path(cfg["dataset_path_prefix"]) / task_id,
-    )
-    client = TaskClient()
-    task_dirs = client.download_tasks(task_ids=[task_git_id])
-    return Task(task_dir=task_dirs[0]).instruction
+
+def _load_parquet(parquet_path: str) -> pd.DataFrame:
+    """Load and cache the parquet file."""
+    cached = _parquet_cache.get(parquet_path)
+    if cached is None:
+        cached = pd.read_parquet(parquet_path)
+        _parquet_cache[parquet_path] = cached
+    return cached
+
+
+def _load_task(parquet_path: str, task_id: str) -> tuple[str, str, str | None]:
+    """Look up a task from the parquet and return (instruction, task_dir, task_files).
+
+    Args:
+        parquet_path: Path to the SLIME harbor parquet file.
+        task_id: Harbor task identifier (e.g. ``django__django-13410``).
+
+    Returns:
+        instruction: Task instruction text.
+        task_dir: Path where task files will be materialized (generate() unpacks if needed).
+        task_files: Base64-encoded tar.gz of task files, or None if not present.
+    """
+    df = _load_parquet(parquet_path)
+    for _, row in df.iterrows():
+        instance = row["metadata"].get("instance", {})
+        if instance.get("task_id") == task_id:
+            return instance["instruction"], instance["task_dir"], instance.get("task_files")
+    raise ValueError(f"task_id {task_id!r} not found in {parquet_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -154,7 +211,7 @@ def _content_str(content: object) -> str:
     return "\n".join(p for p in parts if p)
 
 
-def _print_conversation(captures: list[CapturedTurn]) -> None:
+def _print_conversation(captures: list[AgentTurn]) -> None:
     """Render captured proxy turns as a rich conversation with token stats."""
     if not captures:
         _console.print("[dim]No proxy captures.[/dim]")
@@ -231,7 +288,7 @@ def _print_conversation(captures: list[CapturedTurn]) -> None:
 
 
 def check_token_in_token_out(
-    captures: list[CapturedTurn],
+    captures: list[AgentTurn],
     tokenizer: Any,
 ) -> bool:
     """Verify strict token-in/token-out invariants across all captured turns.
@@ -364,13 +421,13 @@ def check_token_in_token_out(
 
 
 def check_messages_match_trajectory(
-    captures: list[CapturedTurn],
+    captures: list[AgentTurn],
     trajectory_path: Path,
 ) -> bool:
     """Check that captures[i].messages matches the claude-code.txt trajectory.
 
     This checks the *Anthropic-format* message list stored in each
-    CapturedTurn, not the token sequence.  For token correctness use
+    AgentTurn, not the token sequence.  For token correctness use
     ``check_token_in_token_out``.
 
     For each turn i, ``captures[i].messages`` should equal the accumulated
@@ -579,7 +636,7 @@ def run_proxy_unit_tests(tokenizer: Any) -> bool:
 
     # ---- Test 8: _content_blocks_to_openai_message — text only ----
     text_blocks = [{"type": "text", "text": "I will help you."}]
-    oai_msg = _content_blocks_to_openai_message(text_blocks)
+    oai_msg = _protocol_adapter._content_blocks_to_openai_message(text_blocks)
     if oai_msg.get("role") != "assistant" or oai_msg.get("content") != "I will help you.":
         failures.append(
             f"Test 8 (OpenAI text msg): unexpected message: {oai_msg}"
@@ -590,7 +647,7 @@ def run_proxy_unit_tests(tokenizer: Any) -> bool:
     # ---- Test 9: _content_blocks_to_openai_message — tool_use ----
     tool_blocks = [{"type": "tool_use", "id": "toolu_0001", "name": "Read",
                     "input": {"file_path": "/foo"}}]
-    oai_tool_msg = _content_blocks_to_openai_message(tool_blocks)
+    oai_tool_msg = _protocol_adapter._content_blocks_to_openai_message(tool_blocks)
     tc = (oai_tool_msg.get("tool_calls") or [{}])[0]
     if (tc.get("id") != "toolu_0001"
             or tc.get("function", {}).get("name") != "Read"
@@ -602,9 +659,9 @@ def run_proxy_unit_tests(tokenizer: Any) -> bool:
         _console.print("[green]✓ Test 9: tool_use blocks → correct OpenAI tool_calls.[/green]")
 
     # ---- Test 10: _openai_sse_events — well-formed SSE with [DONE] and finish_reason ----
-    sse_chunks = _openai_sse_events("chatcmpl_test", "qwen3", text_blocks, "end_turn", 100, 10)
+    sse_chunks = _protocol_adapter._openai_sse_events("chatcmpl_test", "qwen3", text_blocks, "end_turn", 100, 10)
     sse_text = b"".join(sse_chunks).decode()
-    expected_finish = _OPENAI_FINISH_REASON["end_turn"]  # "stop"
+    expected_finish = _protocol_adapter._OPENAI_FINISH_REASON["end_turn"]  # "stop"
     if not sse_text.endswith("data: [DONE]\n\n"):
         failures.append("Test 10 (OpenAI SSE): stream does not end with [DONE].")
     elif f'"finish_reason": "{expected_finish}"' not in sse_text:
@@ -632,7 +689,7 @@ def run_proxy_unit_tests(tokenizer: Any) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _check_tio_silent(captures: list[CapturedTurn], tokenizer: Any) -> bool:
+def _check_tio_silent(captures: list[AgentTurn], tokenizer: Any) -> bool:
     """Same three invariants as check_token_in_token_out but returns bool, no output."""
     for i, turn in enumerate(captures):
         if len(turn.log_probs) != len(turn.output_ids):
@@ -651,15 +708,20 @@ def _check_tio_silent(captures: list[CapturedTurn], tokenizer: Any) -> bool:
 
 async def _run_task(
     task_id: str,
+    parquet_path: str,
     args: Namespace,
     tokenizer: Any,
 ) -> dict:
     """Run one task and return a compact result dict (no rich output)."""
     try:
-        instruction = _load_instruction(task_id)
-        sample = Sample(prompt=instruction, label=task_id)
+        instruction, task_dir, task_files = _load_task(parquet_path, task_id)
+        sample = Sample(
+            prompt=instruction,
+            label=task_id,
+            metadata={"instance": {"task_id": task_id, "task_dir": task_dir, "task_files": task_files}},
+        )
         result = await generate(args, sample, {})
-        captures: list[CapturedTurn] = getattr(result, "_proxy_captures", None) or []
+        captures: list[AgentTurn] = getattr(result, "_proxy_turns", None) or []
         tio_ok = _check_tio_silent(captures, tokenizer)
 
         asst_tokens = sum(result.loss_mask) if result.loss_mask else 0
@@ -760,10 +822,10 @@ def _print_multi_summary(results: list[dict], elapsed: float) -> bool:
 
 async def main(
     task_ids: list[str],
+    parquet_path: str,
     hf_checkpoint: str,
-    trials_dir: str,
     sglang_url: str,
-    agent: str,
+    custom_config: dict[str, Any],
     unit_test_only: bool,
 ) -> None:
     # Load tokenizer (needed for unit tests and token-in/token-out check)
@@ -777,21 +839,20 @@ async def main(
     if unit_test_only:
         sys.exit(0 if unit_ok else 1)
 
-    SWEBENCH_CONFIGS["sglang_url"] = sglang_url
-    SWEBENCH_CONFIGS["trials_dir"] = trials_dir
-    SWEBENCH_CONFIGS["agent_name"] = agent
-    url_env = _AGENT_URL_ENV.get(agent, "ANTHROPIC_BASE_URL")
-    logger.info("Agent: %s  (URL env: %s)  SGLang: %s", agent, url_env, sglang_url)
+    agent = str(custom_config["agent_name"])
+    trials_dir = str(custom_config["trials_dir"])
+    agent_url_env = str(custom_config["agent_url_env"])
+    logger.info("Agent: %s  (URL env: %s)  SGLang: %s", agent, agent_url_env, sglang_url)
 
     # -----------------------------------------------------------------------
     # Multi-task concurrent run
     # -----------------------------------------------------------------------
     if len(task_ids) > 1:
         import time
-        args = _build_args(hf_checkpoint)
+        args = _build_args(hf_checkpoint, sglang_url, custom_config)
         logger.info("Running %d tasks concurrently…", len(task_ids))
         t0 = time.monotonic()
-        results = await asyncio.gather(*[_run_task(tid, args, tokenizer) for tid in task_ids])
+        results = await asyncio.gather(*[_run_task(tid, parquet_path, args, tokenizer) for tid in task_ids])
         elapsed = time.monotonic() - t0
         all_pass = _print_multi_summary(list(results), elapsed)
         sys.exit(0 if all_pass else 1)
@@ -801,16 +862,20 @@ async def main(
     # -----------------------------------------------------------------------
     task_id = task_ids[0]
     logger.info("Loading instruction for task: %s", task_id)
-    instruction = _load_instruction(task_id)
+    instruction, task_dir, task_files = _load_task(parquet_path, task_id)
     logger.info("Instruction preview: %s…", instruction[:120].replace("\n", " "))
 
-    args = _build_args(hf_checkpoint)
-    sample = Sample(prompt=instruction, label=task_id)
+    args = _build_args(hf_checkpoint, sglang_url, custom_config)
+    sample = Sample(
+        prompt=instruction,
+        label=task_id,
+        metadata={"instance": {"task_id": task_id, "task_dir": task_dir, "task_files": task_files}},
+    )
 
     logger.info("Running generate() for task: %s", task_id)
     result = await generate(args, sample, {})
 
-    captures: list[CapturedTurn] = getattr(result, "_proxy_captures", None) or []
+    captures: list[AgentTurn] = getattr(result, "_proxy_turns", None) or []
 
     # -----------------------------------------------------------------------
     # Conversation
@@ -838,7 +903,7 @@ async def main(
         check_messages_match_trajectory(captures, trajectory_path)
     else:
         _console.print(
-            f"[yellow]No trial dir found under {args.trials_dir!r} for {task_id}[/yellow]"
+            f"[yellow]No trial dir found under {trials_dir!r} for {task_id}[/yellow]"
         )
 
     # -----------------------------------------------------------------------
@@ -880,14 +945,14 @@ async def main(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Test harbor generate on SWEBench tasks")
+    parser = argparse.ArgumentParser(description="Test harbor generate on harbor tasks")
 
     # ---- task selection (mutually exclusive) ----
     task_group = parser.add_mutually_exclusive_group()
     task_group.add_argument(
         "-t", "--task",
         default=None,
-        help="Single SWEBench task ID (default: django__django-13410)",
+        help="Single harbor task ID (e.g. django__django-13410)",
     )
     task_group.add_argument(
         "--tasks",
@@ -904,26 +969,42 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
+        "--parquet",
+        required=False,
+        default=None,
+        metavar="PATH",
+        help="Path to the SLIME harbor parquet file (local or S3). Required unless --unit-test.",
+    )
+    parser.add_argument(
         "--hf-checkpoint",
-        default="Qwen/Qwen3-Coder-Next",
+        required=True,
         help="HuggingFace tokenizer checkpoint — must match what SGLang loaded.",
     )
     parser.add_argument(
-        "--trials-dir",
-        default="trials_test",
-        help="Directory to write trial artifacts (default: trials_test)",
+        "--config",
+        default=str(DEFAULT_CONFIG_PATH),
+        help=f"Path to flat Harbor custom config YAML (default: {DEFAULT_CONFIG_PATH})",
     )
     parser.add_argument(
         "--sglang-url",
-        default=SWEBENCH_CONFIGS["sglang_url"],
+        default=os.environ.get("SGLANG_URL", "http://127.0.0.1:30000"),
         help="Base URL of the SGLang server "
              "(default: SGLANG_URL env var or http://127.0.0.1:30000)",
     )
     parser.add_argument(
         "--agent",
-        default=SWEBENCH_CONFIGS["agent_name"],
-        help=f"Harbor agent name (default: {SWEBENCH_CONFIGS['agent_name']}).  "
-             f"Known agents: {', '.join(sorted(_AGENT_URL_ENV))}.",
+        default=None,
+        help="Override Harbor agent name from the config file.",
+    )
+    parser.add_argument(
+        "--agent-url-env",
+        default=None,
+        help="Override the agent API base URL environment variable from the config file.",
+    )
+    parser.add_argument(
+        "--trials-dir",
+        default=None,
+        help="Override the trials_dir from the config file.",
     )
     parser.add_argument(
         "--proxy-host",
@@ -948,15 +1029,25 @@ if __name__ == "__main__":
     else:
         task_ids = ["django__django-13410"]  # sensible single-task default
 
-    hf_checkpoint = args.hf_checkpoint or SWEBENCH_CONFIGS["model"]
+    if not args.unit_test and not args.parquet:
+        parser.error("--parquet is required unless --unit-test is set")
+
+    hf_checkpoint = args.hf_checkpoint
+    custom_config = _load_custom_config(args.config)
+    if args.agent:
+        custom_config["agent_name"] = args.agent
+    if args.agent_url_env:
+        custom_config["agent_url_env"] = args.agent_url_env
+    if args.trials_dir:
+        custom_config["trials_dir"] = args.trials_dir
     if args.proxy_host:
-        SWEBENCH_CONFIGS["proxy_host"] = args.proxy_host
+        custom_config["harbor_proxy_host"] = args.proxy_host
 
     asyncio.run(main(
         task_ids,
+        args.parquet or "",
         hf_checkpoint,
-        args.trials_dir,
         args.sglang_url,
-        args.agent,
+        custom_config,
         args.unit_test,
     ))

@@ -20,8 +20,8 @@ CKPT_ARGS=(
 )
 
 ROLLOUT_ARGS=(
-   --prompt-data /root/harbor-data/swebench_verified/train.parquet
-   --input-key task_id
+   --prompt-data /data/harbor/swebench-verified/swebench-verified_2026_03_12.parquet
+   --input-key prompt
    --metadata-key metadata
    --rollout-shuffle
    --num-rollout 1
@@ -46,6 +46,8 @@ PERF_ARGS=(
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 2
    --sglang-mem-fraction-static 0.7
+   --sglang-tool-call-parser qwen
+   --use-slime-router
 )
 
 MISC_ARGS=(
@@ -57,8 +59,8 @@ MISC_ARGS=(
 )
 
 CUSTOM_ARGS=(
-   --custom-generate-function-path examples.harbor.generate_with_harbor.generate
-   --custom-rm-path examples.harbor.generate_with_harbor.reward_func
+   --custom-generate-function-path examples.harbor.harbor_rollout.generate
+   --custom-rm-path examples.harbor.harbor_rollout.reward_func
 )
 
 DEBUG_ARGS=(
@@ -67,9 +69,22 @@ DEBUG_ARGS=(
 )
 
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
+HARBOR_PORT_BASE="${HARBOR_PROXY_PORT_BASE:-19000}"
+HARBOR_N_CONCURRENT="${HARBOR_N_CONCURRENT:-16}"
+HARBOR_CONFIG_PATH="/tmp/swe_harbor_debug.yaml"
+
+cp "${SCRIPT_DIR}/swe_harbor.yaml" "${HARBOR_CONFIG_PATH}"
+cat >> "${HARBOR_CONFIG_PATH}" <<EOF
+harbor_proxy_port_base: ${HARBOR_PORT_BASE}
+harbor_n_concurrent_tasks: ${HARBOR_N_CONCURRENT}
+EOF
+
+CUSTOM_ARGS+=(
+   --custom-config-path "${HARBOR_CONFIG_PATH}"
+)
 
 # Start Ray head only if not already running on this machine.
-if ray status --address="http://127.0.0.1:8265" &>/dev/null; then
+if ray status &>/dev/null; then
    echo "Ray already running — reusing existing cluster."
 else
    ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 4 --disable-usage-stats

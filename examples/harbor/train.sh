@@ -27,12 +27,12 @@ CKPT_ARGS=(
 )
 
 ROLLOUT_ARGS=(
-   --prompt-data /root/harbor-data/swebench_verified/train.parquet
-   --input-key task_id
+   --prompt-data /data/harbor/swebench-verified/swebench-verified_2026_03_12.parquet
+   --input-key prompt
    --metadata-key metadata
    --rollout-shuffle
    --num-rollout 3000
-   --rollout-batch-size 8
+   --rollout-batch-size 16
    --n-samples-per-prompt 8
    --rollout-max-response-len 32768
    --rollout-temperature 1
@@ -92,13 +92,15 @@ WANDB_ARGS=(
    --use-wandb
    --wandb-team n-alignment
    --wandb-project blackbox-rl-agent
-   --wandb-group harbor-qwen3-4b-sweverified-bsz16-onpolicy
+   --wandb-group harbor-qwen3-4b-sweverified-codex-bsz8-onpolicy
    --wandb-key 852fc153cc57c9266416085a2d78f2ca9277e671
 )
 
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 2
    --sglang-mem-fraction-static 0.7
+   --sglang-tool-call-parser qwen
+   --use-slime-router
    --sglang-router-policy consistent_hashing
 )
 
@@ -114,13 +116,55 @@ MISC_ARGS=(
 )
 
 CUSTOM_ARGS=(
-   --custom-generate-function-path examples.harbor.generate_with_harbor.generate
-   --custom-rm-path examples.harbor.generate_with_harbor.reward_func
+   --custom-generate-function-path examples.harbor.harbor_rollout.generate
+   --custom-rm-path examples.harbor.harbor_rollout.reward_func
 )
 
-# launch the master node of ray in container
-export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
-ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 8 --disable-usage-stats
+# ---------------------------------------------------------------------------
+# Multi-node setup
+# ---------------------------------------------------------------------------
+# For multi-node training set these before running:
+#   MASTER_ADDR=<head node IP>
+#   NUM_NODES=<total node count>          (default: 1)
+#   NODE_RANK=<this node's rank 0..N-1>  (default: 0)
+#
+# On head node (rank 0):   bash train.sh
+# On worker nodes (rank>0): MASTER_ADDR=<head> NODE_RANK=<rank> bash train.sh
+#   Worker nodes skip ray start --head and join the existing cluster instead.
+# ---------------------------------------------------------------------------
+
+NUM_NODES="${NUM_NODES:-1}"
+NODE_RANK="${NODE_RANK:-0}"
+NUM_GPUS_PER_NODE=8
+HARBOR_N_CONCURRENT="${HARBOR_N_CONCURRENT:-16}"
+
+# Each rollout worker on a node needs its own port range.
+# With n_concurrent_tasks=16 per worker, stride by 32 (headroom) per rank.
+HARBOR_PORT_BASE=$((19000 + NODE_RANK * 32))
+HARBOR_CONFIG_PATH="/tmp/swe_harbor_rank_${NODE_RANK}.yaml"
+
+cp "${SCRIPT_DIR}/swe_harbor_codex.yaml" "${HARBOR_CONFIG_PATH}"
+cat >> "${HARBOR_CONFIG_PATH}" <<EOF
+harbor_proxy_port_base: ${HARBOR_PORT_BASE}
+harbor_n_concurrent_tasks: ${HARBOR_N_CONCURRENT}
+EOF
+
+CUSTOM_ARGS+=(
+   --custom-config-path "${HARBOR_CONFIG_PATH}"
+)
+
+if [ "${NODE_RANK}" = "0" ]; then
+    ray start --head --node-ip-address "${MASTER_ADDR}" \
+        --num-gpus ${NUM_GPUS_PER_NODE} --disable-usage-stats
+else
+    # Worker node: join the head's Ray cluster
+    ray start --address="${MASTER_ADDR}:6379" \
+        --num-gpus ${NUM_GPUS_PER_NODE} --disable-usage-stats
+    # Workers don't submit the job — only head node does
+    echo "Worker node rank=${NODE_RANK} joined Ray cluster at ${MASTER_ADDR}:6379"
+    wait
+    exit 0
+fi
 
 RUNTIME_ENV_JSON="{
   \"env_vars\": {
@@ -133,9 +177,9 @@ RUNTIME_ENV_JSON="{
 ray job submit --address="http://127.0.0.1:8265" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 train.py \
-   --actor-num-nodes 1 \
-   --actor-num-gpus-per-node 8 \
-   --rollout-num-gpus 8 \
+   --actor-num-nodes ${NUM_NODES} \
+   --actor-num-gpus-per-node ${NUM_GPUS_PER_NODE} \
+   --rollout-num-gpus $((NUM_NODES * NUM_GPUS_PER_NODE)) \
    --colocate \
    ${MODEL_ARGS[@]} \
    ${CKPT_ARGS[@]} \
